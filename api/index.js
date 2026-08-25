@@ -526,3 +526,4 @@ app.post(
 | VERIFICATION CHALLENGE
 |--------------------------------------------------------------------------
 */
+module.exports = app;
