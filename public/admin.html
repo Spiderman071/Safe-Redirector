@@ -1,0 +1,7 @@
+<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin</title><link rel="stylesheet" href="/style.css"><main><section class=admin><b>SR</b><small>ADMIN PANEL</small><h1>Generate Link</h1><input id=k type=password placeholder="Admin key"><input id=u type=url placeholder="https://example.com"><button id=g>Generate Link</button><p id=m></p><hr><div id=l></div></section></main><script>
+const $=x=>document.getElementById(x),key=localStorage.key||"";k.value=key;
+function h(){localStorage.key=k.value;return{"Content-Type":"application/json","x-admin-key":k.value}}
+async function load(){let r=await fetch("/api/admin/list",{headers:h()}),d=await r.json();l.innerHTML=r.ok?d.map(x=>`<article><b>${x.active?"ACTIVE":"DISABLED"}</b><a target=_blank href="${x.shortUrl}">${x.shortUrl}</a><small>${x.destination}</small>${x.active?`<button onclick="disable('${x.token}')">Disable</button>`:""}</article>`).join(""):"<p>"+(d.error||"Unauthorized")+"</p>"}
+async function disable(t){await fetch("/api/admin/disable",{method:"POST",headers:h(),body:JSON.stringify({token:t})});load()}
+g.onclick=async()=>{m.textContent="Creating…";let r=await fetch("/api/admin/create",{method:"POST",headers:h(),body:JSON.stringify({url:u.value})}),d=await r.json();m.innerHTML=r.ok?`<a target=_blank href="${d.url}">${d.url}</a>`:d.error;u.value="";load()};if(key)load();
+</script>
