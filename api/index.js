@@ -1,27 +1,528 @@
-const express=require("express"),helmet=require("helmet"),rateLimit=require("express-rate-limit"),cookieParser=require("cookie-parser"),crypto=require("crypto"),path=require("path"),{Pool}=require("pg");
-const app=express(), pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false},max:5});
-const ADMIN=process.env.ADMIN_KEY||"", SECRET=process.env.SESSION_SECRET||"", BASE=process.env.BASE_URL||"";
-let ready;
-async function db(){if(!ready)ready=pool.query(`CREATE TABLE IF NOT EXISTS redirect_links(token TEXT PRIMARY KEY,destination TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);return ready}
-const token=()=>crypto.randomBytes(24).toString("base64url");
-const sig=s=>crypto.createHmac("sha256",SECRET).update(s).digest("base64url");
-function make(p){const b=Buffer.from(JSON.stringify(p)).toString("base64url");return b+"."+sig(b)}
-function read(v){try{if(!v||!v.includes("."))return null;const [b,s]=v.split("."),e=sig(b),a=Buffer.from(s),c=Buffer.from(e);if(a.length!==c.length||!crypto.timingSafeEqual(a,c))return null;const p=JSON.parse(Buffer.from(b,"base64url"));return p.exp>Date.now()?p:null}catch{return null}}
-function cookie(res,p){res.cookie("rd",make(p),{httpOnly:true,secure:true,sameSite:"lax",maxAge:120000,path:"/"})}
-function validUrl(x){try{const u=new URL(String(x||""));return ["http:","https:"].includes(u.protocol)?u.toString():null}catch{return null}}
-const limit=rateLimit({windowMs:60000,limit:40,standardHeaders:true,legacyHeaders:false});
-const admin=rateLimit({windowMs:60000,limit:30,standardHeaders:true,legacyHeaders:false});
-app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:"20kb"}));app.use(cookieParser());
-app.use(express.static(path.join(__dirname,"..","public")));
-app.get("/health",(_,r)=>r.json({ok:true}));
-function auth(req){return ADMIN&&req.get("x-admin-key")===ADMIN}
+const express = require("express");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
+const path = require("path");
+const { MongoClient } = require("mongodb");
 
-app.post("/api/admin/create",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});const u=validUrl(req.body?.url);if(!u)return res.status(400).json({error:"Invalid URL"});await db();let t=token();while((await pool.query("select 1 from redirect_links where token=$1",[t])).rowCount)t=token();await pool.query("insert into redirect_links(token,destination) values($1,$2)",[t,u]);const base=BASE||`${req.protocol}://${req.get("host")}`;res.json({ok:true,token:t,url:`${base}/auto/${t}`})}catch(e){console.error(e);res.status(500).json({error:"Database error"})}});
-app.get("/api/admin/list",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});await db();const q=await pool.query("select token,destination,active,created_at from redirect_links order by created_at desc limit 100");const base=BASE||`${req.protocol}://${req.get("host")}`;res.json(q.rows.map(x=>({...x,shortUrl:`${base}/auto/${x.token}`})))}catch(e){res.status(500).json({error:"Database error"})}});
-app.post("/api/admin/disable",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});await db();const q=await pool.query("update redirect_links set active=false where token=$1 returning token",[String(req.body?.token||"")]);if(!q.rowCount)return res.status(404).json({error:"Token not found"});res.json({ok:true})}catch(e){res.status(500).json({error:"Database error"})}});
+const app = express();
 
-app.get("/auto/:token",limit,async(req,res)=>{try{await db();const q=await pool.query("select active from redirect_links where token=$1",[req.params.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).sendFile(path.join(__dirname,"..","public","404.html"));const n=Date.now();cookie(res,{token:req.params.token,iat:n,readyAt:n+3000,exp:n+120000});res.sendFile(path.join(__dirname,"..","public","redirect.html"))}catch(e){res.status(500).send("Database error")}});
-app.post("/api/redirect/complete",limit,async(req,res)=>{try{const s=read(req.cookies.rd);if(!s)return res.status(403).json({error:"Session expired"});await db();const q=await pool.query("select destination,active from redirect_links where token=$1",[s.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).json({error:"Link disabled"});if(Date.now()<s.readyAt){const a=crypto.randomInt(2,13),b=crypto.randomInt(2,13);cookie(res,{...s,challenge:true,answer:a+b,challengeExp:Date.now()+120000});return res.status(428).json({challenge:{question:`What is ${a} + ${b}?`}})}cookie(res,{token:s.token,verified:true,exp:Date.now()+30000});res.json({ok:true,redirect:q.rows[0].destination})}catch(e){res.status(500).json({error:"Database error"})}});
-app.post("/api/redirect/challenge",limit,async(req,res)=>{try{const s=read(req.cookies.rd);if(!s?.challenge||Date.now()>s.challengeExp)return res.status(403).json({error:"Challenge expired"});if(Number(req.body?.answer)!==s.answer)return res.status(403).json({error:"Incorrect answer"});await db();const q=await pool.query("select destination,active from redirect_links where token=$1",[s.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).json({error:"Link disabled"});cookie(res,{token:s.token,verified:true,exp:Date.now()+30000});res.json({ok:true,redirect:q.rows[0].destination})}catch(e){res.status(500).json({error:"Database error"})}});
-app.use((req,res)=>req.path.startsWith("/api/")?res.status(404).json({error:"Not found"}):res.status(404).sendFile(path.join(__dirname,"..","public","404.html")));
-module.exports=app;
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = process.env.MONGODB_DB || "safe_redirector";
+
+let clientPromise;
+
+function getClient() {
+  if (!MONGODB_URI) {
+    throw new Error("MONGODB_URI is missing");
+  }
+
+  if (!clientPromise) {
+    const client = new MongoClient(MONGODB_URI);
+    clientPromise = client.connect();
+  }
+
+  return clientPromise;
+}
+
+async function getCollection() {
+  const client = await getClient();
+  const db = client.db(DB_NAME);
+  const collection = db.collection("redirect_links");
+
+  await collection.createIndex(
+    { token: 1 },
+    { unique: true }
+  );
+
+  return collection;
+}
+
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const BASE_URL = process.env.BASE_URL || "";
+
+function generateToken() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+function createSignature(data) {
+  return crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(data)
+    .digest("base64url");
+}
+
+function createSession(payload) {
+  const body = Buffer
+    .from(JSON.stringify(payload))
+    .toString("base64url");
+
+  const signature = createSignature(body);
+
+  return `${body}.${signature}`;
+}
+
+function readSession(value) {
+  try {
+    if (!value || !value.includes(".")) {
+      return null;
+    }
+
+    const [body, signature] = value.split(".");
+
+    const expected = createSignature(body);
+
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+
+    if (a.length !== b.length) {
+      return null;
+    }
+
+    if (!crypto.timingSafeEqual(a, b)) {
+      return null;
+    }
+
+    const payload = JSON.parse(
+      Buffer.from(body, "base64url").toString()
+    );
+
+    if (!payload.exp || payload.exp < Date.now()) {
+      return null;
+    }
+
+    return payload;
+
+  } catch {
+    return null;
+  }
+}
+
+function setSessionCookie(res, payload) {
+  res.cookie(
+    "rd",
+    createSession(payload),
+    {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      maxAge: 120000,
+      path: "/"
+    }
+  );
+}
+
+function validateURL(value) {
+  try {
+    const url = new URL(String(value || ""));
+
+    if (
+      url.protocol !== "http:" &&
+      url.protocol !== "https:"
+    ) {
+      return null;
+    }
+
+    return url.toString();
+
+  } catch {
+    return null;
+  }
+}
+
+const generalLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 40,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const adminLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false
+  })
+);
+
+app.use(
+  express.json({
+    limit: "20kb"
+  })
+);
+
+app.use(cookieParser());
+
+app.use(
+  express.static(
+    path.join(__dirname, "..", "public")
+  )
+);
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    database: "MongoDB"
+  });
+});
+
+function isAdmin(req) {
+  return (
+    ADMIN_KEY &&
+    req.get("x-admin-key") === ADMIN_KEY
+  );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CREATE REDIRECT LINK
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  "/api/admin/create",
+  adminLimit,
+  async (req, res) => {
+
+    try {
+
+      if (!isAdmin(req)) {
+        return res.status(401).json({
+          error: "Unauthorized"
+        });
+      }
+
+      const destination = validateURL(
+        req.body?.url
+      );
+
+      if (!destination) {
+        return res.status(400).json({
+          error: "Invalid URL"
+        });
+      }
+
+      const collection = await getCollection();
+
+      let token;
+
+      while (true) {
+
+        token = generateToken();
+
+        const exists = await collection.findOne({
+          token
+        });
+
+        if (!exists) {
+          break;
+        }
+      }
+
+      await collection.insertOne({
+        token,
+        destination,
+        active: true,
+        createdAt: new Date()
+      });
+
+      const base =
+        BASE_URL ||
+        `${req.protocol}://${req.get("host")}`;
+
+      res.json({
+        ok: true,
+        token,
+        url: `${base}/auto/${token}`
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).json({
+        error: "Database error"
+      });
+    }
+  }
+);
+
+
+/*
+|--------------------------------------------------------------------------
+| LIST LINKS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  "/api/admin/list",
+  adminLimit,
+  async (req, res) => {
+
+    try {
+
+      if (!isAdmin(req)) {
+        return res.status(401).json({
+          error: "Unauthorized"
+        });
+      }
+
+      const collection = await getCollection();
+
+      const links = await collection
+        .find({})
+        .sort({
+          createdAt: -1
+        })
+        .limit(100)
+        .toArray();
+
+      const base =
+        BASE_URL ||
+        `${req.protocol}://${req.get("host")}`;
+
+      const result = links.map(link => ({
+        token: link.token,
+        destination: link.destination,
+        active: link.active,
+        createdAt: link.createdAt,
+        shortUrl: `${base}/auto/${link.token}`
+      }));
+
+      res.json(result);
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).json({
+        error: "Database error"
+      });
+    }
+  }
+);
+
+
+/*
+|--------------------------------------------------------------------------
+| DISABLE LINK
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  "/api/admin/disable",
+  adminLimit,
+  async (req, res) => {
+
+    try {
+
+      if (!isAdmin(req)) {
+        return res.status(401).json({
+          error: "Unauthorized"
+        });
+      }
+
+      const collection = await getCollection();
+
+      const result =
+        await collection.updateOne(
+          {
+            token: String(
+              req.body?.token || ""
+            )
+          },
+          {
+            $set: {
+              active: false
+            }
+          }
+        );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          error: "Token not found"
+        });
+      }
+
+      res.json({
+        ok: true
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).json({
+        error: "Database error"
+      });
+    }
+  }
+);
+
+
+/*
+|--------------------------------------------------------------------------
+| USER REDIRECT PAGE
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  "/auto/:token",
+  generalLimit,
+  async (req, res) => {
+
+    try {
+
+      const collection = await getCollection();
+
+      const link =
+        await collection.findOne({
+          token: req.params.token
+        });
+
+      if (!link || !link.active) {
+
+        return res
+          .status(404)
+          .sendFile(
+            path.join(
+              __dirname,
+              "..",
+              "public",
+              "404.html"
+            )
+          );
+      }
+
+      const now = Date.now();
+
+      setSessionCookie(res, {
+        token: req.params.token,
+        iat: now,
+        readyAt: now + 3000,
+        exp: now + 120000
+      });
+
+      res.sendFile(
+        path.join(
+          __dirname,
+          "..",
+          "public",
+          "redirect.html"
+        )
+      );
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).send(
+        "Database error"
+      );
+    }
+  }
+);
+
+
+/*
+|--------------------------------------------------------------------------
+| COMPLETE REDIRECT
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  "/api/redirect/complete",
+  generalLimit,
+  async (req, res) => {
+
+    try {
+
+      const session =
+        readSession(req.cookies.rd);
+
+      if (!session) {
+
+        return res.status(403).json({
+          error: "Session expired"
+        });
+      }
+
+      const collection =
+        await getCollection();
+
+      const link =
+        await collection.findOne({
+          token: session.token
+        });
+
+      if (!link || !link.active) {
+
+        return res.status(404).json({
+          error: "Link disabled"
+        });
+      }
+
+      /*
+       * Server-side 3 second protection.
+       */
+
+      if (Date.now() < session.readyAt) {
+
+        const a =
+          crypto.randomInt(2, 13);
+
+        const b =
+          crypto.randomInt(2, 13);
+
+        setSessionCookie(res, {
+          ...session,
+          challenge: true,
+          answer: a + b,
+          challengeExp:
+            Date.now() + 120000
+        });
+
+        return res.status(428).json({
+          challenge: {
+            question:
+              `What is ${a} + ${b}?`
+          }
+        });
+      }
+
+      setSessionCookie(res, {
+        token: session.token,
+        verified: true,
+        exp: Date.now() + 30000
+      });
+
+      res.json({
+        ok: true,
+        redirect: link.destination
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).json({
+        error: "Database error"
+      });
+    }
+  }
+);
+
+
+/*
+|--------------------------------------------------------------------------
+| VERIFICATION CHALLENGE
+|--------------------------------------------------------------------------
+*/
