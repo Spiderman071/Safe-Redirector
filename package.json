@@ -1,0 +1,16 @@
+{
+  "name": "safe-redirector-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "cookie-parser": "^1.4.7",
+    "express-rate-limit": "^8.0.1",
+    "pg": "^8.16.3"
+  }
+}
