@@ -1,0 +1,27 @@
+const express=require("express"),helmet=require("helmet"),rateLimit=require("express-rate-limit"),cookieParser=require("cookie-parser"),crypto=require("crypto"),path=require("path"),{Pool}=require("pg");
+const app=express(), pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false},max:5});
+const ADMIN=process.env.ADMIN_KEY||"", SECRET=process.env.SESSION_SECRET||"", BASE=process.env.BASE_URL||"";
+let ready;
+async function db(){if(!ready)ready=pool.query(`CREATE TABLE IF NOT EXISTS redirect_links(token TEXT PRIMARY KEY,destination TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);return ready}
+const token=()=>crypto.randomBytes(24).toString("base64url");
+const sig=s=>crypto.createHmac("sha256",SECRET).update(s).digest("base64url");
+function make(p){const b=Buffer.from(JSON.stringify(p)).toString("base64url");return b+"."+sig(b)}
+function read(v){try{if(!v||!v.includes("."))return null;const [b,s]=v.split("."),e=sig(b),a=Buffer.from(s),c=Buffer.from(e);if(a.length!==c.length||!crypto.timingSafeEqual(a,c))return null;const p=JSON.parse(Buffer.from(b,"base64url"));return p.exp>Date.now()?p:null}catch{return null}}
+function cookie(res,p){res.cookie("rd",make(p),{httpOnly:true,secure:true,sameSite:"lax",maxAge:120000,path:"/"})}
+function validUrl(x){try{const u=new URL(String(x||""));return ["http:","https:"].includes(u.protocol)?u.toString():null}catch{return null}}
+const limit=rateLimit({windowMs:60000,limit:40,standardHeaders:true,legacyHeaders:false});
+const admin=rateLimit({windowMs:60000,limit:30,standardHeaders:true,legacyHeaders:false});
+app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:"20kb"}));app.use(cookieParser());
+app.use(express.static(path.join(__dirname,"..","public")));
+app.get("/health",(_,r)=>r.json({ok:true}));
+function auth(req){return ADMIN&&req.get("x-admin-key")===ADMIN}
+
+app.post("/api/admin/create",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});const u=validUrl(req.body?.url);if(!u)return res.status(400).json({error:"Invalid URL"});await db();let t=token();while((await pool.query("select 1 from redirect_links where token=$1",[t])).rowCount)t=token();await pool.query("insert into redirect_links(token,destination) values($1,$2)",[t,u]);const base=BASE||`${req.protocol}://${req.get("host")}`;res.json({ok:true,token:t,url:`${base}/auto/${t}`})}catch(e){console.error(e);res.status(500).json({error:"Database error"})}});
+app.get("/api/admin/list",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});await db();const q=await pool.query("select token,destination,active,created_at from redirect_links order by created_at desc limit 100");const base=BASE||`${req.protocol}://${req.get("host")}`;res.json(q.rows.map(x=>({...x,shortUrl:`${base}/auto/${x.token}`})))}catch(e){res.status(500).json({error:"Database error"})}});
+app.post("/api/admin/disable",admin,async(req,res)=>{try{if(!auth(req))return res.status(401).json({error:"Unauthorized"});await db();const q=await pool.query("update redirect_links set active=false where token=$1 returning token",[String(req.body?.token||"")]);if(!q.rowCount)return res.status(404).json({error:"Token not found"});res.json({ok:true})}catch(e){res.status(500).json({error:"Database error"})}});
+
+app.get("/auto/:token",limit,async(req,res)=>{try{await db();const q=await pool.query("select active from redirect_links where token=$1",[req.params.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).sendFile(path.join(__dirname,"..","public","404.html"));const n=Date.now();cookie(res,{token:req.params.token,iat:n,readyAt:n+3000,exp:n+120000});res.sendFile(path.join(__dirname,"..","public","redirect.html"))}catch(e){res.status(500).send("Database error")}});
+app.post("/api/redirect/complete",limit,async(req,res)=>{try{const s=read(req.cookies.rd);if(!s)return res.status(403).json({error:"Session expired"});await db();const q=await pool.query("select destination,active from redirect_links where token=$1",[s.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).json({error:"Link disabled"});if(Date.now()<s.readyAt){const a=crypto.randomInt(2,13),b=crypto.randomInt(2,13);cookie(res,{...s,challenge:true,answer:a+b,challengeExp:Date.now()+120000});return res.status(428).json({challenge:{question:`What is ${a} + ${b}?`}})}cookie(res,{token:s.token,verified:true,exp:Date.now()+30000});res.json({ok:true,redirect:q.rows[0].destination})}catch(e){res.status(500).json({error:"Database error"})}});
+app.post("/api/redirect/challenge",limit,async(req,res)=>{try{const s=read(req.cookies.rd);if(!s?.challenge||Date.now()>s.challengeExp)return res.status(403).json({error:"Challenge expired"});if(Number(req.body?.answer)!==s.answer)return res.status(403).json({error:"Incorrect answer"});await db();const q=await pool.query("select destination,active from redirect_links where token=$1",[s.token]);if(!q.rowCount||!q.rows[0].active)return res.status(404).json({error:"Link disabled"});cookie(res,{token:s.token,verified:true,exp:Date.now()+30000});res.json({ok:true,redirect:q.rows[0].destination})}catch(e){res.status(500).json({error:"Database error"})}});
+app.use((req,res)=>req.path.startsWith("/api/")?res.status(404).json({error:"Not found"}):res.status(404).sendFile(path.join(__dirname,"..","public","404.html")));
+module.exports=app;
